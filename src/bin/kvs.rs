@@ -5,6 +5,7 @@
 //! kvs get <key>        prints the value, or "Key not found" (exit code 1)
 //! kvs rm <key>         "Key not found" (exit code 1) if it isn't there
 //! kvs stats            number of keys and reclaimable bytes
+//! kvs compact          rewrite the log without stale records
 //! ```
 
 use std::path::PathBuf;
@@ -34,6 +35,8 @@ enum Command {
     Rm { key: String },
     /// Show how many keys there are and how much of the log is stale.
     Stats,
+    /// Rewrite the log keeping only live records.
+    Compact,
 }
 
 fn run(cli: Cli) -> Result<ExitCode, Error> {
@@ -51,6 +54,11 @@ fn run(cli: Cli) -> Result<ExitCode, Error> {
         Command::Stats => {
             println!("keys: {}", store.len());
             println!("stale bytes: {}", store.stale_bytes());
+        }
+        Command::Compact => {
+            let reclaimed = store.stale_bytes();
+            store.compact()?;
+            println!("reclaimed {reclaimed} bytes");
         }
     }
     Ok(ExitCode::SUCCESS)

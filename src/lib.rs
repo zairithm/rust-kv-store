@@ -7,6 +7,11 @@
 //! On `open`, the log is replayed from the start to rebuild the index. If the very
 //! last record was only half written (a crash in the middle of a write), it is cut
 //! off; a broken record anywhere else is reported as corruption.
+//!
+//! Overwritten and removed values stay in the log as "stale bytes". Compaction
+//! copies only the live records into a new file and swaps it in with a rename, so
+//! a crash at any point leaves either the old log or the new one, never a mix. It
+//! runs on its own once stale bytes pass a threshold and outweigh the live data.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -21,6 +26,10 @@ pub use error::{Error, Result};
 
 /// Name of the log file inside the store's directory.
 pub const LOG_FILE: &str = "kvs.log";
+/// Temporary file compaction writes before swapping it in.
+const COMPACT_FILE: &str = "kvs.log.compact";
+/// Default stale-byte level at which compaction runs by itself.
+pub const DEFAULT_COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 
 /// One line of the log.
 #[derive(Debug, Serialize, Deserialize)]
@@ -48,8 +57,10 @@ pub struct KvStore {
     /// Key -> its latest `set` record.
     index: HashMap<String, Pos>,
     /// Bytes in the log that no longer matter (overwritten or removed values and
-    /// the `rm` records themselves). Compaction will reclaim them.
+    /// the `rm` records themselves). Compaction reclaims them.
     stale_bytes: u64,
+    /// Compact automatically once `stale_bytes` reaches this and exceeds the live bytes.
+    compaction_threshold: u64,
 }
 
 impl KvStore {
@@ -58,6 +69,12 @@ impl KvStore {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         let path = dir.join(LOG_FILE);
+        // A leftover from a compaction that crashed before its rename. The real log
+        // was never touched, so the half-built copy can simply go.
+        let leftover = dir.join(COMPACT_FILE);
+        if leftover.exists() {
+            fs::remove_file(&leftover)?;
+        }
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -78,7 +95,13 @@ impl KvStore {
             write_pos: replay.good_len,
             index: replay.index,
             stale_bytes: replay.stale_bytes,
+            compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
         })
+    }
+
+    /// Changes when automatic compaction kicks in (see [`DEFAULT_COMPACTION_THRESHOLD`]).
+    pub fn set_compaction_threshold(&mut self, bytes: u64) {
+        self.compaction_threshold = bytes;
     }
 
     /// Sets `key` to `value`, replacing any old value.
@@ -90,7 +113,7 @@ impl KvStore {
         if let Some(old) = self.index.insert(key, pos) {
             self.stale_bytes += old.len;
         }
-        Ok(())
+        self.maybe_compact()
     }
 
     /// Returns the value for `key`, if any.
@@ -118,6 +141,61 @@ impl KvStore {
         let pos = self.append(&Record::Rm { key: key.into() })?;
         let old = self.index.remove(key).expect("checked above");
         self.stale_bytes += old.len + pos.len;
+        self.maybe_compact()
+    }
+
+    /// Rewrites the log with only the live records.
+    ///
+    /// 1. Copy each key's latest `set` record into `kvs.log.compact` and sync it.
+    /// 2. Point the reader and writer at the new file.
+    /// 3. Rename it over `kvs.log`. The rename is atomic, so a crash before it leaves
+    ///    the old log untouched (and `open` deletes the half-built copy).
+    pub fn compact(&mut self) -> Result<()> {
+        let dir = self.path.parent().expect("log path has a parent");
+        let tmp_path = dir.join(COMPACT_FILE);
+        let mut tmp = BufWriter::new(File::create(&tmp_path)?);
+
+        // Copy in log order, so the old file is read front to back.
+        let mut live: Vec<(String, Pos)> =
+            self.index.iter().map(|(k, p)| (k.clone(), *p)).collect();
+        live.sort_by_key(|(_, pos)| pos.offset);
+
+        let mut new_index = HashMap::with_capacity(live.len());
+        let mut offset = 0u64;
+        let mut buf = Vec::new();
+        for (key, pos) in live {
+            self.reader.seek(SeekFrom::Start(pos.offset))?;
+            buf.clear();
+            (&mut self.reader).take(pos.len).read_to_end(&mut buf)?;
+            tmp.write_all(&buf)?;
+            new_index.insert(
+                key,
+                Pos {
+                    offset,
+                    len: pos.len,
+                },
+            );
+            offset += pos.len;
+        }
+        tmp.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+
+        // Swap the handles first: on Windows a file can't be replaced while we still
+        // hold the old one open for appending.
+        self.reader = BufReader::new(File::open(&tmp_path)?);
+        self.writer = BufWriter::new(OpenOptions::new().append(true).open(&tmp_path)?);
+        fs::rename(&tmp_path, &self.path)?;
+
+        self.index = new_index;
+        self.write_pos = offset;
+        self.stale_bytes = 0;
+        Ok(())
+    }
+
+    fn maybe_compact(&mut self) -> Result<()> {
+        let live_bytes = self.write_pos - self.stale_bytes;
+        if self.stale_bytes >= self.compaction_threshold && self.stale_bytes > live_bytes {
+            self.compact()?;
+        }
         Ok(())
     }
 
@@ -326,6 +404,77 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(KvStore::open(dir.path()), Err(Error::Corrupt(_))));
+    }
+
+    fn log_len(dir: &TempDir) -> u64 {
+        fs::metadata(dir.path().join(LOG_FILE)).unwrap().len()
+    }
+
+    #[test]
+    fn compact_shrinks_the_log_and_keeps_the_data() {
+        let dir = TempDir::new().unwrap();
+        let mut kv = KvStore::open(dir.path()).unwrap();
+        for i in 0..200 {
+            kv.set(s("counter"), i.to_string()).unwrap();
+        }
+        kv.set(s("keep"), s("me")).unwrap();
+        kv.set(s("gone"), s("soon")).unwrap();
+        kv.remove("gone").unwrap();
+        let before = log_len(&dir);
+
+        kv.compact().unwrap();
+        assert_eq!(kv.stale_bytes(), 0);
+        assert!(log_len(&dir) < before / 10, "log should shrink a lot");
+        assert_eq!(kv.get("counter").unwrap().as_deref(), Some("199"));
+        assert_eq!(kv.get("keep").unwrap().as_deref(), Some("me"));
+        assert_eq!(kv.get("gone").unwrap(), None);
+
+        // Writes after compaction land in the new file and survive reopening.
+        kv.set(s("after"), s("compaction")).unwrap();
+        drop(kv);
+        let mut kv = KvStore::open(dir.path()).unwrap();
+        assert_eq!(kv.get("after").unwrap().as_deref(), Some("compaction"));
+        assert_eq!(kv.get("counter").unwrap().as_deref(), Some("199"));
+        assert_eq!(kv.len(), 3);
+        assert!(!dir.path().join(COMPACT_FILE).exists());
+    }
+
+    #[test]
+    fn compaction_runs_by_itself() {
+        let dir = TempDir::new().unwrap();
+        let mut kv = KvStore::open(dir.path()).unwrap();
+        kv.set_compaction_threshold(2_000);
+        for i in 0..1_000 {
+            kv.set(s("hot"), i.to_string()).unwrap();
+        }
+        assert!(kv.stale_bytes() < 2_000, "stale bytes stay bounded");
+        assert!(log_len(&dir) < 4_000, "log stays small");
+        assert_eq!(kv.get("hot").unwrap().as_deref(), Some("999"));
+    }
+
+    #[test]
+    fn empty_store_compacts_to_empty() {
+        let dir = TempDir::new().unwrap();
+        let mut kv = KvStore::open(dir.path()).unwrap();
+        kv.set(s("a"), s("1")).unwrap();
+        kv.remove("a").unwrap();
+        kv.compact().unwrap();
+        assert_eq!(log_len(&dir), 0);
+        assert!(kv.is_empty());
+    }
+
+    #[test]
+    fn leftover_compaction_file_is_cleaned_up() {
+        let dir = TempDir::new().unwrap();
+        {
+            let mut kv = KvStore::open(dir.path()).unwrap();
+            kv.set(s("a"), s("1")).unwrap();
+        }
+        // A compaction that crashed before its rename.
+        fs::write(dir.path().join(COMPACT_FILE), "half written").unwrap();
+        let mut kv = KvStore::open(dir.path()).unwrap();
+        assert!(!dir.path().join(COMPACT_FILE).exists());
+        assert_eq!(kv.get("a").unwrap().as_deref(), Some("1"));
     }
 
     #[test]

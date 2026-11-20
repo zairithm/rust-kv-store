@@ -19,6 +19,8 @@ Key not found
 $ kvs stats
 keys: 1
 stale bytes: 106
+$ kvs compact
+reclaimed 106 bytes
 ```
 
 `--dir <path>` picks the store directory (default: the current folder). Exit codes: `0` success, `1` key not found, `2` any other error (for example a corrupt log).
@@ -46,7 +48,8 @@ offset 122  {"op":"rm","key":"name"}
 - **Reads** look up the key's offset and length in the index, then do one seek and one read.
 - **Opening** replays the log from the start to rebuild the index.
 - **Crash safety:** if the last record was only half written, it is cut off on the next open. A broken record anywhere else stops the open with a `Corrupt` error rather than silently losing data.
-- **Stale bytes:** overwritten values, removed values and `rm` records are counted, so compaction knows when the log is worth rewriting.
+- **Stale bytes:** overwritten values, removed values and `rm` records are counted.
+- **Compaction** copies only each key's latest record into `kvs.log.compact`, syncs it, then renames it over `kvs.log`. The rename is atomic, so a crash leaves either the old log or the new one; a leftover half-built copy is deleted on the next open. It runs by itself once stale bytes reach 1 MiB and outweigh the live data, or on demand with `kvs compact`.
 
 ## Development
 
@@ -63,7 +66,7 @@ Unit tests cover the store (round trips, reopening, tricky values, torn writes, 
 - [x] In-memory store with `set`, `get` and `remove`
 - [x] Persist every write to a log file and rebuild the index on start
 - [x] Command-line interface
-- [ ] Log compaction
+- [x] Log compaction (automatic and `kvs compact`)
 - [ ] TCP server and client
 - [ ] Benchmarks and a write-up of the design
 
