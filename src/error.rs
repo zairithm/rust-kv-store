@@ -13,6 +13,8 @@ pub enum Error {
     /// The index pointed at a record that isn't a `set` for that key. Means the
     /// log was changed by something else while the store was open.
     Corrupt(String),
+    /// The server answered with an error (client side only).
+    Server(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -24,6 +26,7 @@ impl fmt::Display for Error {
             Self::Serde(e) => write!(f, "bad record: {e}"),
             Self::KeyNotFound => write!(f, "Key not found"),
             Self::Corrupt(msg) => write!(f, "corrupt log: {msg}"),
+            Self::Server(msg) => write!(f, "server error: {msg}"),
         }
     }
 }
@@ -33,7 +36,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(e) => Some(e),
             Self::Serde(e) => Some(e),
-            Self::KeyNotFound | Self::Corrupt(_) => None,
+            Self::KeyNotFound | Self::Corrupt(_) | Self::Server(_) => None,
         }
     }
 }
