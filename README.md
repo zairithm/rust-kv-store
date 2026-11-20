@@ -25,6 +25,28 @@ reclaimed 106 bytes
 
 `--dir <path>` picks the store directory (default: the current folder). Exit codes: `0` success, `1` key not found, `2` any other error (for example a corrupt log).
 
+Over the network:
+
+```console
+$ kvs-server --addr 127.0.0.1:4000 --dir data &
+listening on 127.0.0.1:4000
+$ kvs-client set lang rust
+$ kvs-client get lang
+rust
+$ kvs-client rm nope
+Key not found
+```
+
+`kvs-client` uses the same exit codes as `kvs`. The protocol is one JSON object per line:
+
+```text
+→ {"cmd":"set","key":"lang","value":"rust"}    ← {"ok":null}
+→ {"cmd":"get","key":"lang"}                   ← {"ok":"rust"}
+→ {"cmd":"rm","key":"nope"}                    ← {"err":"Key not found"}
+```
+
+The server runs each connection on its own thread; they share one store behind a `Mutex`, so commands never interleave inside the log.
+
 As a library:
 
 ```rust
@@ -59,7 +81,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-Unit tests cover the store (round trips, reopening, tricky values, torn writes, corruption). Integration tests in `tests/cli.rs` run the real `kvs` binary.
+Unit tests cover the store (round trips, reopening, tricky values, torn writes, corruption, compaction). `tests/cli.rs` runs the real `kvs` binary; `tests/server.rs` covers the protocol, 8 concurrent clients, bad requests, and the `kvs-server` + `kvs-client` binaries together.
 
 ## Roadmap
 
@@ -67,7 +89,7 @@ Unit tests cover the store (round trips, reopening, tricky values, torn writes, 
 - [x] Persist every write to a log file and rebuild the index on start
 - [x] Command-line interface
 - [x] Log compaction (automatic and `kvs compact`)
-- [ ] TCP server and client
+- [x] TCP server and client (`kvs-server`, `kvs-client`)
 - [ ] Benchmarks and a write-up of the design
 
 ## License

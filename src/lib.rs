@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod error;
+pub mod net;
 
 pub use error::{Error, Result};
 
