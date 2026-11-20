@@ -75,3 +75,21 @@ fn missing_arguments_show_usage() {
         .failure()
         .stderr(predicate::str::contains("Usage"));
 }
+
+#[test]
+fn compact_reclaims_stale_bytes() {
+    let dir = TempDir::new().unwrap();
+    kvs(&dir, &["set", "a", "1"]).success();
+    kvs(&dir, &["set", "a", "2"]).success();
+    kvs(&dir, &["compact"]).success().stdout(
+        predicate::str::starts_with("reclaimed ")
+            .and(predicate::str::contains("reclaimed 0").not()),
+    );
+    kvs(&dir, &["stats"])
+        .success()
+        .stdout(predicate::str::contains("stale bytes: 0"));
+    kvs(&dir, &["get", "a"]).success().stdout(
+        "2
+",
+    );
+}
